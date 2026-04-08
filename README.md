@@ -45,6 +45,30 @@ To configure the extension, set the following options in your CKAN configuration
     # Default: ckan
     ckanext.geoserver_client.workspace = ckan
 
+----------------------
+Command Line Interface
+----------------------
+
+The extension provides several CKAN CLI commands under the `geoserver` command for managing GeoServer publishing.
+
+**Initialize GeoServer Workspace**
+
+Creates the configured GeoServer workspace if it does not already exist.
+
+    ckan -c /etc/ckan/default/production.ini geoserver init
+
+**Publish a Single Resource**
+
+Downloads a CKAN GeoJSON resource, converts it to a shapefile, and publishes it natively as a layer inside GeoServer.
+
+    ckan -c /etc/ckan/default/production.ini geoserver publish <resource_id>
+
+**Bulk Publish Legacy Resources**
+
+Finds all existing GeoJSON resources in the CKAN database and automatically processes/publishes them into GeoServer.
+
+    ckan -c /etc/ckan/default/production.ini geoserver publish-all
+
 ------------------------
 Development Installation
 ------------------------
