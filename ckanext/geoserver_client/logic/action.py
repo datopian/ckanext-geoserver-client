@@ -57,62 +57,58 @@ def geoserver_ingest_geojson(context, data_dict):
     geojson_path = os.path.join(base_dir, f"{resource_id}.geojson")
     shp_path = os.path.join(base_dir, f"{resource_id}.shp")
     zip_path = os.path.join(base_dir, f"{resource_id}.zip")
-
     try:
-        import shutil
-        import ckan.lib.uploader as uploader
+        import ckan.model as model
+        import ckan.plugins.toolkit as toolkit
 
-        geojson_downloaded = False
+        headers = {}
+        sysadmin_context = {}
+        temp_token = context.get("api_token")
+        token_dynamically_generated = False
 
-        if resource.get("url_type") == "upload":
-            upload = uploader.get_resource_uploader(resource)
+        if temp_token:
+            headers["Authorization"] = temp_token
+        else:
+            # Fallback path for isolated individual runs where the loop master didn't generate a token 
+            sysadmin = model.Session.query(model.User).filter_by(sysadmin=True, state='active').first()
 
-            if hasattr(upload, "get_path"):
+            if sysadmin:
                 try:
-                    filepath = upload.get_path(resource["id"])
-                    if filepath and os.path.exists(filepath):
-                        shutil.copy(filepath, geojson_path)
-                        geojson_downloaded = True
-                except Exception:
-                    pass
-
-            if not geojson_downloaded and hasattr(upload, "get_url"):
-                try:
-                    direct_url = upload.get_url()
-                except TypeError:
-                    try:
-                        direct_url = upload.get_url(resource["id"])
-                    except:
-                        direct_url = None
-
-                if direct_url and direct_url.startswith("http"):
-                    resp = requests.get(direct_url, stream=True, timeout=15)
-                    resp.raise_for_status()
-
-                    with open(geojson_path, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    geojson_downloaded = True
-
-        if not geojson_downloaded:
-            headers = {}
-
-            if context.get("user"):
-                try:
-                    user_obj = p.toolkit.get_action("user_show")(
-                        context, {"id": context["user"]}
+                    sysadmin_context = {
+                        "model": model,
+                        "session": model.Session,
+                        "ignore_auth": True,
+                        "user": sysadmin.name
+                    }
+                    token_dict = toolkit.get_action("api_token_create")(
+                        sysadmin_context,
+                        {"user": sysadmin.name, "name": f"geoserver_script_{resource_id}", "expires_in": 3600}
                     )
-                    if user_obj and "apikey" in user_obj:
-                        headers["Authorization"] = user_obj["apikey"]
-                except Exception:
-                    pass
 
+                    if token_dict and token_dict.get("token"):
+                        temp_token = token_dict["token"]
+                        headers["Authorization"] = temp_token
+                        token_dynamically_generated = True
+                except Exception as e:
+                    log.warning(f"Failed to dynamically mint Sysadmin token: {e}")
+
+        try:
             resp = requests.get(url, stream=True, timeout=15, headers=headers)
             resp.raise_for_status()
 
             with open(geojson_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
+        finally:
+            # Cleanup tokens
+            if token_dynamically_generated and temp_token and sysadmin_context:
+                try:
+                    toolkit.get_action("api_token_revoke")(
+                        sysadmin_context,
+                        {"token": temp_token}
+                    )
+                except Exception:
+                    pass
 
         cmd = [
             "ogr2ogr",

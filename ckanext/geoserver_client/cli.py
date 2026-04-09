@@ -51,6 +51,26 @@ def publish_all():
             ],
         }
 
+        # Dynamically mint one Sysadmin Auth token for the entire bulk loop to prevent DB bloat
+        sysadmin = model.Session.query(model.User).filter_by(sysadmin=True, state='active').first()
+        temp_token = None
+        if sysadmin:
+            try:
+                sysadmin_context = {
+                    "model": model,
+                    "session": model.Session,
+                    "ignore_auth": True,
+                    "user": sysadmin.name
+                }
+                token_dict = toolkit.get_action("api_token_create")(
+                    sysadmin_context,
+                    {"user": sysadmin.name, "name": "geoserver_bulk_migration", "expires_in": 7200}
+                )
+                temp_token = token_dict.get("token")
+                context["api_token"] = temp_token
+            except Exception as e:
+                click.secho(f"Warning: Failed to generate bulk SYSADMIN token: {e}", fg="yellow")
+
         geojson_resources = []
         # Stream results instead of fully hydrating all ORM models to prevent memory exhaustion
         query = (
@@ -93,3 +113,11 @@ def publish_all():
 
     except Exception as e:
         click.secho(f"Error during bulk migration: {e}", fg="red")
+    finally:
+        # Revoke the bulk token immediately after the pipeline finishes
+        if temp_token and sysadmin:
+            try:
+                toolkit.get_action("api_token_revoke")(sysadmin_context, {"token": temp_token})
+                click.secho("Cleanup: Bulk Sysadmin token revoked.", fg="green")
+            except Exception:
+                pass
