@@ -68,10 +68,13 @@ def geoserver_ingest_geojson(context, data_dict):
             upload = uploader.get_resource_uploader(resource)
 
             if hasattr(upload, "get_path"):
-                filepath = upload.get_path(resource["id"])
-                if filepath and os.path.exists(filepath):
-                    shutil.copy(filepath, geojson_path)
-                    geojson_downloaded = True
+                try:
+                    filepath = upload.get_path(resource["id"])
+                    if filepath and os.path.exists(filepath):
+                        shutil.copy(filepath, geojson_path)
+                        geojson_downloaded = True
+                except Exception:
+                    pass
 
             if not geojson_downloaded and hasattr(upload, "get_url"):
                 try:
@@ -85,13 +88,26 @@ def geoserver_ingest_geojson(context, data_dict):
                 if direct_url and direct_url.startswith("http"):
                     resp = requests.get(direct_url, stream=True, timeout=15)
                     resp.raise_for_status()
+
                     with open(geojson_path, "wb") as f:
                         for chunk in resp.iter_content(chunk_size=8192):
                             f.write(chunk)
                     geojson_downloaded = True
 
         if not geojson_downloaded:
-            resp = requests.get(url, stream=True, timeout=15)
+            headers = {}
+
+            if context.get("user"):
+                try:
+                    user_obj = p.toolkit.get_action("user_show")(
+                        context, {"id": context["user"]}
+                    )
+                    if user_obj and "apikey" in user_obj:
+                        headers["Authorization"] = user_obj["apikey"]
+                except Exception:
+                    pass
+
+            resp = requests.get(url, stream=True, timeout=15, headers=headers)
             resp.raise_for_status()
 
             with open(geojson_path, "wb") as f:
