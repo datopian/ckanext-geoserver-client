@@ -59,7 +59,20 @@ def geoserver_ingest_geojson(context, data_dict):
     zip_path = os.path.join(base_dir, f"{resource_id}.zip")
 
     try:
-        resp = requests.get(url, stream=True, timeout=10)
+        headers = {}
+
+        if context.get("user"):
+            try:
+                user_obj = p.toolkit.get_action("user_show")(
+                    context, {"id": context["user"]}
+                )
+
+                if user_obj and "apikey" in user_obj:
+                    headers["Authorization"] = user_obj["apikey"]
+            except Exception:
+                pass
+
+        resp = requests.get(url, stream=True, timeout=15, headers=headers)
         resp.raise_for_status()
 
         with open(geojson_path, "wb") as f:
@@ -74,10 +87,12 @@ def geoserver_ingest_geojson(context, data_dict):
             geojson_path,
             "-nln",
             resource_id,
+            "-nlt",
+            "PROMOTE_TO_MULTI",
             "-overwrite",
         ]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
         if proc.returncode != 0:
             log.error(f"ogr2ogr conversion to shapefile failed: {proc.stderr}")
@@ -89,7 +104,7 @@ def geoserver_ingest_geojson(context, data_dict):
                 if os.path.exists(f):
                     zipf.write(f, os.path.basename(f))
 
-        # Push the Shapefile up to GeoServer, link WMS/WFS endpoints, and apply any attached SLD styling
+        # Push the Shapefile to the GeoServer, link WMS/WFS endpoints, and apply any attached SLD styling
         geoserver_api = GeoServerAPI()
         geoserver_api.upload_shapefile(resource_id, zip_path)
 
@@ -128,6 +143,7 @@ def geoserver_ingest_geojson(context, data_dict):
                 )
 
                 style_name = f"style_{resource_id}"
+
                 if geoserver_api.upload_style(style_name, sld_body):
                     geoserver_api.set_layer_style(resource_id, style_name)
             except Exception as e:
