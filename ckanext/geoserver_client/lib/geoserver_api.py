@@ -75,32 +75,27 @@ class GeoServerAPI(object):
         """Builds a permanent SLD style directly into the GeoServer engine catalog."""
         self.ensure_workspace()
 
-        endpoint = f"workspaces/{self.workspace}/styles?name={style_name}"
         headers = {"Content-type": "application/vnd.ogc.sld+xml"}
-        url = f"{self.url.rstrip('/')}/{endpoint.lstrip('/')}"
         auth = HTTPBasicAuth(self.user, self.password)
+        base = self.url.rstrip("/")
+        payload = sld_body.encode("utf-8")
 
-        # Try an atomic direct POST creation with the SLD payload
-        res = requests.post(
-            url, auth=auth, headers=headers, data=sld_body.encode("utf-8")
-        )
+        # Try to create the style via POST
+        post_url = f"{base}/workspaces/{self.workspace}/styles?name={style_name}"
+        res = requests.post(post_url, auth=auth, headers=headers, data=payload)
 
-        # GeoServer throws 500 or 409 if it already exists, so we gracefully catch and update via PUT
-        if res.status_code >= 400:
-            if res.status_code in (409, 500) and "already exists" in res.text.lower():
-                pass
+        if res.status_code < 400:
+            return True
 
-            endpoint_put = f"workspaces/{self.workspace}/styles/{style_name}"
-            url_put = f"{self.url.rstrip('/')}/{endpoint_put.lstrip('/')}"
-            res_put = requests.put(
-                url_put, auth=auth, headers=headers, data=sld_body.encode("utf-8")
-            )
+        # Style already exists — GeoServer returns 403, 409, or 500 depending on version.
+        # Fall back to PUT to update the existing style.
+        log.debug(f"Style POST {res.status_code} for {style_name!r}, updating via PUT")
+        put_url = f"{base}/workspaces/{self.workspace}/styles/{style_name}"
+        res_put = requests.put(put_url, auth=auth, headers=headers, data=payload)
 
-            if res_put.status_code >= 400:
-                log.error(
-                    f"Failed to gracefully PUT style {style_name}: {res_put.text}"
-                )
-                res_put.raise_for_status()
+        if res_put.status_code >= 400:
+            log.error(f"Failed to PUT style {style_name!r}: {res_put.text}")
+            res_put.raise_for_status()
 
         return True
 

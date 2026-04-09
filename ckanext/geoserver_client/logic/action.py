@@ -39,10 +39,98 @@ def delete_geoserver_layer_job(resource_id):
         )
 
 
+def _fetch_resource_file(resource, dest_path):
+    """
+    Fetch a resource file to dest_path without going through the public HTTP stack.
+
+    Strategy (in order):
+    1. Direct CKAN local storage path — constructs the path using CKAN's known
+       directory layout, completely bypassing auth, routing, and the uploader API.
+    2. boto3 / S3 — works when ckanext-s3filestore is active; tries the nested
+       key pattern s3filestore uses, then a flat key as fallback.
+    3. HTTP fallback — last resort for genuinely external URLs.
+    """
+    resource_id = resource["id"]
+    url = resource.get("url", "")
+
+    # Try CKAN local storage path first, if configured and accessible
+    try:
+        from ckan.plugins import toolkit
+
+        storage_path = toolkit.config.get("ckan.storage_path", "/var/lib/ckan")
+        local_path = os.path.join(
+            storage_path,
+            "resources",
+            resource_id[0:3],
+            resource_id[3:6],
+            resource_id[6:],
+        )
+        if os.path.isfile(local_path):
+            log.debug(f"Reading {resource_id} directly from disk: {local_path}")
+            shutil.copy2(local_path, dest_path)
+            return
+        else:
+            log.debug(f"Local storage path not found for {resource_id}: {local_path}")
+    except Exception as e:
+        log.debug(f"Local storage path check failed for {resource_id}: {e}")
+
+    # Try boto3 (S3 / MinIO) if not in local storage, and if boto3 is available
+    try:
+        import boto3
+        from botocore.config import Config
+        from ckan.plugins import toolkit
+
+        bucket = toolkit.config.get("ckanext.s3filestore.aws_bucket_name")
+        key_id = toolkit.config.get("ckanext.s3filestore.aws_access_key_id")
+        secret = toolkit.config.get("ckanext.s3filestore.aws_secret_access_key")
+        endpoint = toolkit.config.get(
+            "ckanext.s3filestore.host_name"
+        ) or toolkit.config.get("ckanext.s3filestore.aws_host_name")
+        region = toolkit.config.get("ckanext.s3filestore.region_name", "us-east-1")
+        storage_path = toolkit.config.get(
+            "ckanext.s3filestore.aws_storage_path", "resources"
+        ).strip("/")
+
+        if bucket and key_id and secret and endpoint:
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=secret,
+                region_name=region,
+                config=Config(signature_version="s3v4"),
+            )
+
+            nested_key = f"{storage_path}/{resource_id[0:3]}/{resource_id[3:6]}/{resource_id[6:]}"
+            flat_key = f"{storage_path}/{resource_id}"
+
+            for object_key in (nested_key, flat_key):
+                try:
+                    log.debug(f"Trying s3://{bucket}/{object_key}")
+                    s3.download_file(bucket, object_key, dest_path)
+                    return
+                except Exception as e:
+                    log.debug(f"S3 key {object_key} failed: {e}")
+    except ImportError:
+        pass
+    except Exception as e:
+        log.debug(f"S3 setup failed for {resource_id}: {e}")
+
+    # Fallback to HTTP fetch if all else fails
+    log.debug(f"Falling back to HTTP fetch for {resource_id}: {url}")
+    resp = requests.get(url, stream=True, timeout=30)
+    resp.raise_for_status()
+
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
 @p.toolkit.side_effect_free
 def geoserver_ingest_geojson(context, data_dict):
     """
-    Ingest a GeoJSON resource, convert to Shapefile, and publish to GeoServer with optional SLD styling if attached to the parent dataset.
+    Ingest a GeoJSON resource, convert to Shapefile, and publish to GeoServer
+    with optional SLD styling if attached to the parent dataset.
     """
     p.toolkit.check_access("package_update", context, data_dict)
     resource_id = p.toolkit.get_or_bust(data_dict, "resource_id")
@@ -57,58 +145,10 @@ def geoserver_ingest_geojson(context, data_dict):
     geojson_path = os.path.join(base_dir, f"{resource_id}.geojson")
     shp_path = os.path.join(base_dir, f"{resource_id}.shp")
     zip_path = os.path.join(base_dir, f"{resource_id}.zip")
+
     try:
-        import ckan.model as model
-        import ckan.plugins.toolkit as toolkit
-
-        headers = {}
-        sysadmin_context = {}
-        temp_token = context.get("api_token")
-        token_dynamically_generated = False
-
-        if temp_token:
-            headers["Authorization"] = temp_token
-        else:
-            # Fallback path for isolated individual runs where the loop master didn't generate a token 
-            sysadmin = model.Session.query(model.User).filter_by(sysadmin=True, state='active').first()
-
-            if sysadmin:
-                try:
-                    sysadmin_context = {
-                        "model": model,
-                        "session": model.Session,
-                        "ignore_auth": True,
-                        "user": sysadmin.name
-                    }
-                    token_dict = toolkit.get_action("api_token_create")(
-                        sysadmin_context,
-                        {"user": sysadmin.name, "name": f"geoserver_script_{resource_id}", "expires_in": 3600}
-                    )
-
-                    if token_dict and token_dict.get("token"):
-                        temp_token = token_dict["token"]
-                        headers["Authorization"] = temp_token
-                        token_dynamically_generated = True
-                except Exception as e:
-                    log.warning(f"Failed to dynamically mint Sysadmin token: {e}")
-
-        try:
-            resp = requests.get(url, stream=True, timeout=15, headers=headers)
-            resp.raise_for_status()
-
-            with open(geojson_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        finally:
-            # Cleanup tokens
-            if token_dynamically_generated and temp_token and sysadmin_context:
-                try:
-                    toolkit.get_action("api_token_revoke")(
-                        sysadmin_context,
-                        {"token": temp_token}
-                    )
-                except Exception:
-                    pass
+        # Fetch the GeoJSON without touching the public HTTP stack
+        _fetch_resource_file(resource, geojson_path)
 
         cmd = [
             "ogr2ogr",
@@ -135,18 +175,17 @@ def geoserver_ingest_geojson(context, data_dict):
                 if os.path.exists(f):
                     zipf.write(f, os.path.basename(f))
 
-        # Push the Shapefile to the GeoServer, link WMS/WFS endpoints, and apply any attached SLD styling
+        # Push the Shapefile to GeoServer, link WMS/WFS endpoints, apply SLD
         geoserver_api = GeoServerAPI()
         geoserver_api.upload_shapefile(resource_id, zip_path)
 
-        # Link GeoServer endpoints dynamically to the frontend WMS map configurations
         base_url = p.toolkit.config.get(
             "ckanext.geoserver_client.public_url", "http://localhost:8080/geoserver"
         )
         workspace = geoserver_api.workspace
         layer = f"{workspace}:{resource_id}"
 
-        # Check for SLD resources attached to the parent dataset and apply if found
+        # Check for SLD resources attached to the parent dataset
         dataset = p.toolkit.get_action("package_show")(
             context, {"id": resource.get("package_id")}
         )
@@ -159,17 +198,20 @@ def geoserver_ingest_geojson(context, data_dict):
             None,
         )
 
-        if sld_res and sld_res.get("url"):
+        if sld_res:
             try:
                 import re
 
-                sld_resp = requests.get(sld_res["url"], timeout=10)
-                sld_resp.raise_for_status()
+                sld_path = os.path.join(base_dir, f"style_{sld_res['id']}.sld")
+                _fetch_resource_file(sld_res, sld_path)
+
+                with open(sld_path, "r", encoding="utf-8") as f:
+                    sld_body = f.read()
 
                 sld_body = re.sub(
                     r"(<NamedLayer>\s*<Name>)[^<]*(</Name>)",
                     lambda m: f"{m.group(1)}{layer}{m.group(2)}",
-                    sld_resp.text,
+                    sld_body,
                     count=1,
                     flags=re.IGNORECASE,
                 )
@@ -188,10 +230,12 @@ def geoserver_ingest_geojson(context, data_dict):
 
         safe_layer = urllib.parse.quote(layer)
         resource["wms_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/wms?service=WMS&version=1.3.0&request=GetCapabilities&layers={safe_layer}{bbox_param}"
+            f"{base_url.rstrip('/')}/{workspace}/wms?service=WMS&version=1.3.0"
+            f"&request=GetCapabilities&layers={safe_layer}{bbox_param}"
         )
         resource["wfs_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/ows?service=WFS&version=2.0.0&request=GetFeature&typeName={safe_layer}&maxFeatures=50&outputFormat=gml3{bbox_param}"
+            f"{base_url.rstrip('/')}/{workspace}/ows?service=WFS&version=2.0.0"
+            f"&request=GetFeature&typeName={safe_layer}&maxFeatures=50&outputFormat=gml3{bbox_param}"
         )
         resource["geoserver_layer"] = layer
 

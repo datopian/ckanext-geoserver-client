@@ -4,43 +4,69 @@ from ckan import plugins as p
 from ckan.tests import factories
 
 
-@pytest.mark.ckan_config("ckan.plugins", "geoserver")
+GEOJSON_DATA = (
+    '{"type":"FeatureCollection","features":[{"type":"Feature",'
+    '"geometry":{"type":"Point","coordinates":[13.0,55.6]},'
+    '"properties":{"name":"Malmo"}}]}'
+)
+
+
+@pytest.mark.ckan_config("ckan.plugins", "geoserver_client")
 @pytest.mark.usefixtures("with_plugins")
 class TestGeoServerActions:
 
     @pytest.fixture
-    def mock_requests_get(self):
-        with patch("ckanext.geoserver_client.logic.action.requests.get") as mock_get:
-            yield mock_get
-
-    def test_geoserver_ingest_geojson(self, mock_requests_get, tmpdir):
-        user = factories.User(sysadmin=True)
-        context = {"user": user["name"], "ignore_auth": True}
-
-        # Test creation of a dummy package/resource inside CKAN natively
+    def geojson_resource(self):
+        """Create a dataset + GeoJSON resource for testing, cleaned up automatically."""
         dataset = factories.Dataset()
         resource = factories.Resource(
             package_id=dataset["id"],
             format="geojson",
             url="http://fake.url/test.geojson",
         )
+        yield resource
+        # Teardown: purge the dataset so nothing lingers in the test DB
+        user = factories.User(sysadmin=True)
+        context = {"user": user["name"], "ignore_auth": True}
+        try:
+            p.toolkit.get_action("dataset_purge")(context, {"id": dataset["id"]})
+        except Exception:
+            pass
 
-        # Setup mocking so the worker doesn't try to actually connect to `http://fake.url` over the wire!
-        geojson_data = '{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[13.0,55.6]},"properties":{"name":"Malmo"}}]}'
+    @pytest.fixture
+    def mock_fetch(self, tmp_path):
+        """
+        Mock _fetch_resource_file so tests never touch the network, local disk,
+        or S3. Writes the sample GeoJSON to dest_path directly.
+        """
+        def _write_geojson(resource, dest_path):
+            with open(dest_path, "w", encoding="utf-8") as f:
+                f.write(GEOJSON_DATA)
 
-        class MockResponse:
-            def __init__(self, content):
-                self.content = content
+        with patch(
+            "ckanext.geoserver_client.logic.action._fetch_resource_file",
+            side_effect=_write_geojson,
+        ):
+            yield
 
-            def iter_content(self, chunk_size):
-                yield self.content
-
-            def raise_for_status(self):
+    @pytest.fixture
+    def cleanup_layer(self):
+        """Remove a GeoServer layer after the test, even if the test fails."""
+        created_ids = []
+        yield created_ids
+        from ckanext.geoserver_client.lib.geoserver_api import GeoServerAPI
+        for resource_id in created_ids:
+            try:
+                GeoServerAPI().delete_layer(resource_id)
+            except Exception:
                 pass
 
-        mock_requests_get.return_value = MockResponse(geojson_data.encode("utf-8"))
+    def test_geoserver_ingest_geojson(self, geojson_resource, mock_fetch, cleanup_layer):
+        user = factories.User(sysadmin=True)
+        context = {"user": user["name"], "ignore_auth": True}
+        resource = geojson_resource
+        cleanup_layer.append(resource["id"])
 
-        # Fire the standalone pipeline!
         res = p.toolkit.get_action("geoserver_ingest_geojson")(
             context, {"resource_id": resource["id"]}
         )
@@ -48,20 +74,11 @@ class TestGeoServerActions:
         assert res["status"] == "success"
         assert res["resource_id"] == resource["id"]
 
-        # Pull it immediately out of DB again, confirm everything sync'd.
         updated_resource = p.toolkit.get_action("resource_show")(
             context, {"id": resource["id"]}
         )
         assert "wms_url" in updated_resource
         assert updated_resource["geoserver_layer"] == f"ckan:{resource['id']}"
-
-        # Cleanup
-        from ckanext.geoserver_client.lib.geoserver_api import GeoServerAPI
-
-        try:
-            GeoServerAPI().delete_layer(resource["id"])
-        except:
-            pass
 
     def test_geoserver_setup_workspace(self):
         user = factories.User(sysadmin=True)
