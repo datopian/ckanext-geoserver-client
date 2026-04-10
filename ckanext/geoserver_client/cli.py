@@ -41,6 +41,8 @@ def publish(resource_id):
 @geoserver.command("publish-all")
 def publish_all():
     """Ingest and Publish all existing GeoJSON resources to GeoServer."""
+    temp_token = None
+    sysadmin = None
     try:
         import ckan.model as model
 
@@ -52,7 +54,11 @@ def publish_all():
         }
 
         # Dynamically mint one Sysadmin Auth token for the entire bulk loop to prevent DB bloat
-        sysadmin = model.Session.query(model.User).filter_by(sysadmin=True, state='active').first()
+        sysadmin = (
+            model.Session.query(model.User)
+            .filter_by(sysadmin=True, state="active")
+            .first()
+        )
         temp_token = None
         if sysadmin:
             try:
@@ -60,16 +66,22 @@ def publish_all():
                     "model": model,
                     "session": model.Session,
                     "ignore_auth": True,
-                    "user": sysadmin.name
+                    "user": sysadmin.name,
                 }
                 token_dict = toolkit.get_action("api_token_create")(
                     sysadmin_context,
-                    {"user": sysadmin.name, "name": "geoserver_bulk_migration", "expires_in": 7200}
+                    {
+                        "user": sysadmin.name,
+                        "name": "geoserver_bulk_migration",
+                        "expires_in": 7200,
+                    },
                 )
                 temp_token = token_dict.get("token")
                 context["api_token"] = temp_token
             except Exception as e:
-                click.secho(f"Warning: Failed to generate bulk SYSADMIN token: {e}", fg="yellow")
+                click.secho(
+                    f"Warning: Failed to generate bulk SYSADMIN token: {e}", fg="yellow"
+                )
 
         geojson_resources = []
         # Stream results instead of fully hydrating all ORM models to prevent memory exhaustion
@@ -92,22 +104,33 @@ def publish_all():
             fg="blue",
         )
         success_count = 0
+        skip_count = 0
 
         for res_id in geojson_resources:
             try:
                 click.secho(f"Processing {res_id}...", fg="yellow")
 
-                toolkit.get_action("geoserver_ingest_geojson")(
+                result = toolkit.get_action("geoserver_ingest_geojson")(
                     context, {"resource_id": res_id}
                 )
 
-                success_count += 1
-                click.secho(f"Success: {res_id} migrated and published!", fg="green")
+                if result.get("status") == "skipped":
+                    skip_count += 1
+                    click.secho(
+                        f"Skipped: {res_id} ({result.get('reason', 'not GeoJSON')})",
+                        fg="yellow",
+                    )
+                else:
+                    success_count += 1
+                    click.secho(
+                        f"Success: {res_id} migrated and published!", fg="green"
+                    )
             except Exception as e:
                 click.secho(f"Failed on {res_id}: {e}", fg="red")
 
         click.secho(
-            f"Finished migrating {success_count}/{len(geojson_resources)} legacy GeoJSONs.",
+            f"Finished: {success_count} published, {skip_count} skipped, "
+            f"{len(geojson_resources) - success_count - skip_count} failed.",
             fg="green",
         )
 
@@ -117,7 +140,9 @@ def publish_all():
         # Revoke the bulk token immediately after the pipeline finishes
         if temp_token and sysadmin:
             try:
-                toolkit.get_action("api_token_revoke")(sysadmin_context, {"token": temp_token})
+                toolkit.get_action("api_token_revoke")(
+                    sysadmin_context, {"token": temp_token}
+                )
                 click.secho("Cleanup: Bulk Sysadmin token revoked.", fg="green")
             except Exception:
                 pass

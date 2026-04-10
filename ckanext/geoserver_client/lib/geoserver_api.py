@@ -28,7 +28,8 @@ class GeoServerAPI(object):
         headers = {"Accept": "application/json", "Content-type": content_type}
 
         response = requests.request(
-            method, url, auth=auth, headers=headers, json=json_data, data=file_data
+            method, url, auth=auth, headers=headers, json=json_data, data=file_data,
+            timeout=30,
         )
         response.raise_for_status()
 
@@ -89,6 +90,10 @@ class GeoServerAPI(object):
 
         # Style already exists — GeoServer returns 403, 409, or 500 depending on version.
         # Fall back to PUT to update the existing style.
+        # Only fall back on "already exists" codes, not 400 Bad Request (invalid SLD).
+        if res.status_code not in (403, 409, 500):
+            log.error(f"Style POST failed with {res.status_code} for {style_name!r}: {res.text}")
+            res.raise_for_status()
         log.debug(f"Style POST {res.status_code} for {style_name!r}, updating via PUT")
         put_url = f"{base}/workspaces/{self.workspace}/styles/{style_name}"
         res_put = requests.put(put_url, auth=auth, headers=headers, data=payload)

@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import tempfile
@@ -41,14 +42,7 @@ def delete_geoserver_layer_job(resource_id):
 
 def _fetch_resource_file(resource, dest_path):
     """
-    Fetch a resource file to dest_path without going through the public HTTP stack.
-
-    Strategy (in order):
-    1. Direct CKAN local storage path — constructs the path using CKAN's known
-       directory layout, completely bypassing auth, routing, and the uploader API.
-    2. boto3 / S3 — works when ckanext-s3filestore is active; tries the nested
-       key pattern s3filestore uses, then a flat key as fallback.
-    3. HTTP fallback — last resort for genuinely external URLs.
+    Fetch a resource file
     """
     resource_id = resource["id"]
     url = resource.get("url", "")
@@ -125,8 +119,11 @@ def _fetch_resource_file(resource, dest_path):
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
+    # Final check: ensure the file actually exists and is not empty
+    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        raise Exception(f"Failed to fetch content for resource {resource_id}")
 
-@p.toolkit.side_effect_free
+
 def geoserver_ingest_geojson(context, data_dict):
     """
     Ingest a GeoJSON resource, convert to Shapefile, and publish to GeoServer
@@ -147,8 +144,36 @@ def geoserver_ingest_geojson(context, data_dict):
     zip_path = os.path.join(base_dir, f"{resource_id}.zip")
 
     try:
-        # Fetch the GeoJSON without touching the public HTTP stack
         _fetch_resource_file(resource, geojson_path)
+
+        # Validate the file is actually GeoJSON before handing to ogr2ogr
+        try:
+            with open(geojson_path, "r", encoding="utf-8-sig") as f:
+                geojson_data = json.load(f)
+            valid_types = {
+                "FeatureCollection",
+                "Feature",
+                "Point",
+                "MultiPoint",
+                "LineString",
+                "MultiLineString",
+                "Polygon",
+                "MultiPolygon",
+                "GeometryCollection",
+            }
+            if geojson_data.get("type") not in valid_types:
+                log.warning(
+                    f"Resource {resource_id} has format=geojson but file is not valid GeoJSON (type={geojson_data.get('type')!r}), skipping"
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "File content is not valid GeoJSON",
+                }
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.warning(
+                f"Resource {resource_id} has format=geojson but file could not be parsed as JSON: {e}, skipping"
+            )
+            return {"status": "skipped", "reason": "File content is not valid GeoJSON"}
 
         cmd = [
             "ogr2ogr",
@@ -160,6 +185,8 @@ def geoserver_ingest_geojson(context, data_dict):
             resource_id,
             "-nlt",
             "PROMOTE_TO_MULTI",
+            "-lco",
+            "ENCODING=UTF-8",
             "-overwrite",
         ]
 
@@ -239,6 +266,7 @@ def geoserver_ingest_geojson(context, data_dict):
         )
         resource["geoserver_layer"] = layer
 
+        context["geoserver_updating"] = True
         p.toolkit.get_action("resource_update")(context, resource)
 
         return {"status": "success", "resource_id": resource_id}

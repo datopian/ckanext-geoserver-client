@@ -4,6 +4,28 @@ ckanext-geoserver-client
 A CKAN extension that provides a client for interacting with GeoServer natively from CKAN. It handles tasks such as workspace creation, uploading shapefiles, styling layers, and synchronizing GeoServer data automatically.
 
 ------------
+Requirements
+------------
+
+**System dependency (required):**
+
+``ogr2ogr`` must be installed on the CKAN server. It is used to convert GeoJSON to Shapefile before uploading to GeoServer::
+
+    # Debian/Ubuntu
+    apt-get install gdal-bin
+
+    # macOS
+    brew install gdal
+
+**Python dependency (optional):**
+
+If you are using S3/MinIO for CKAN file storage (via ``ckanext-s3filestore``), ``boto3`` is required for the extension to fetch resource files directly from S3::
+
+    pip install "boto3>=1.4.4"
+
+If ``ckanext-s3filestore`` is already installed, ``boto3`` will already be present.
+
+------------
 Installation
 ------------
 
@@ -27,7 +49,7 @@ To install ckanext-geoserver-client:
 Configuration Options
 ---------------------
 
-To configure the extension, set the following options in your CKAN configuration file (`production.ini` or via environment variables).
+Set the following options in your CKAN configuration file (``production.ini``) or via environment variables.
 
     # The REST API URL of your GeoServer instance.
     # Default: http://localhost:8080/geoserver/rest
@@ -45,27 +67,63 @@ To configure the extension, set the following options in your CKAN configuration
     # Default: ckan
     ckanext.geoserver_client.workspace = ckan
 
+    # The public-facing GeoServer URL used to build WMS/WFS links on resources
+    # Default: http://localhost:8080/geoserver
+    ckanext.geoserver_client.public_url = http://geoserver:8080/geoserver
+
+**Environment variable equivalents** (for use with ``ckanext-envvars``)::
+
+    CKANEXT__GEOSERVER_CLIENT__REST_URL=http://geoserver:8080/geoserver/rest
+    CKANEXT__GEOSERVER_CLIENT__USER=admin
+    CKANEXT__GEOSERVER_CLIENT__PASSWORD=my_secret_password
+    CKANEXT__GEOSERVER_CLIENT__WORKSPACE=ckan
+    CKANEXT__GEOSERVER_CLIENT__PUBLIC_URL=http://geoserver:8080/geoserver
+
+-------------
+How It Works
+-------------
+
+When a resource is **created or updated**, the plugin checks whether it is a GeoJSON resource. A resource is considered GeoJSON if either:
+
+- Its **format field** is set to ``GeoJSON`` (case-insensitive), or
+- Its **URL** ends with ``.geojson``
+
+If either condition is met, a background job is enqueued that:
+
+1. Fetches the file (from local CKAN storage, S3/MinIO, or HTTP fallback)
+2. Validates the content is valid GeoJSON
+3. Converts it to a Shapefile using ``ogr2ogr``
+4. Uploads the Shapefile to GeoServer and publishes it as a layer
+5. Optionally applies an SLD style if an ``SLD`` resource exists on the same dataset
+6. Updates the resource with ``wms_url``, ``wfs_url``, and ``geoserver_layer`` fields
+
+When a GeoJSON resource is **deleted**, the corresponding GeoServer layer is also removed.
+
+Publishing only happens automatically via the background worker. Make sure the CKAN worker process is running::
+
+    ckan -c /etc/ckan/default/production.ini jobs worker
+
 ----------------------
 Command Line Interface
 ----------------------
 
-The extension provides several CKAN CLI commands under the `geoserver` command for managing GeoServer publishing.
+The extension provides several CKAN CLI commands under the ``geoserver`` command for managing GeoServer publishing.
 
 **Initialize GeoServer Workspace**
 
-Creates the configured GeoServer workspace if it does not already exist.
+Creates the configured GeoServer workspace if it does not already exist::
 
     ckan -c /etc/ckan/default/production.ini geoserver init
 
 **Publish a Single Resource**
 
-Downloads a CKAN GeoJSON resource, converts it to a shapefile, and publishes it natively as a layer inside GeoServer.
+Downloads a CKAN GeoJSON resource, converts it to a shapefile, and publishes it natively as a layer inside GeoServer::
 
     ckan -c /etc/ckan/default/production.ini geoserver publish <resource_id>
 
 **Bulk Publish Legacy Resources**
 
-Finds all existing GeoJSON resources in the CKAN database and automatically processes/publishes them into GeoServer.
+Finds all existing GeoJSON resources in the CKAN database and automatically processes/publishes them into GeoServer::
 
     ckan -c /etc/ckan/default/production.ini geoserver publish-all
 
@@ -79,6 +137,8 @@ To install ckanext-geoserver-client for development, activate your CKAN virtuale
     cd ckanext-geoserver-client
     python setup.py develop
     pip install -r dev-requirements.txt
+
+Note: ``pip install -e .`` is the modern equivalent of ``python setup.py develop``.
 
 -----------------
 Running the Tests
