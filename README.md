@@ -1,153 +1,146 @@
-ckanext-geoserver-client
-========================
+# ckanext-geoserver-client
 
 A CKAN extension that provides a client for interacting with GeoServer natively from CKAN. It handles tasks such as workspace creation, uploading shapefiles, styling layers, and synchronizing GeoServer data automatically.
 
-------------
-Requirements
-------------
+## Requirements
 
 **System dependency (required):**
 
-``ogr2ogr`` must be installed on the CKAN server. It is used to convert GeoJSON to Shapefile before uploading to GeoServer::
+`ogr2ogr` must be installed on the CKAN server. It is used to convert GeoJSON to Shapefile before uploading to GeoServer:
 
-    # Debian/Ubuntu
-    apt-get install gdal-bin
+```bash
+# Debian/Ubuntu
+apt-get install gdal-bin
 
-    # macOS
-    brew install gdal
+# macOS
+brew install gdal
+
+# Alpine Linux
+apk add gdal-bin
+```
 
 **Python dependency (optional):**
 
-If you are using S3/MinIO for CKAN file storage (via ``ckanext-s3filestore``), ``boto3`` is required for the extension to fetch resource files directly from S3::
+If you are using S3/MinIO for CKAN file storage (via `ckanext-s3filestore`), `boto3` is required for the extension to fetch resource files directly from S3:
 
-    pip install "boto3>=1.4.4"
+```bash
+pip install boto3==1.35.77
+```
 
-If ``ckanext-s3filestore`` is already installed, ``boto3`` will already be present.
+If `ckanext-s3filestore` is already installed, `boto3` will already be present. Note: newer versions of `boto3` may cause compatibility issues with `ckanext-s3filestore`.
 
-------------
-Installation
-------------
+## Installation
 
-To install ckanext-geoserver-client:
+1. Activate your CKAN virtual environment:
 
-1. Activate your CKAN virtual environment, for example::
+    ```bash
+    . /usr/lib/ckan/default/bin/activate
+    ```
 
-        . /usr/lib/ckan/default/bin/activate
+2. Install the extension:
 
-2. Install the ckanext-geoserver-client Python package into your virtual environment::
+    ```bash
+    pip install -e git+https://github.com/datopian/ckanext-geoserver-client.git#egg=ckanext-geoserver-client
+    ```
 
-        pip install -e git+https://github.com/datopian/ckanext-geoserver-client.git#egg=ckanext-geoserver-client
+3. Add `geoserver_client` to `ckan.plugins` in your CKAN config file.
 
-3. Add ``geoserver_client`` to the ``ckan.plugins`` setting in your CKAN config file (by default the config file is located at `/etc/ckan/default/production.ini`).
+4. Restart CKAN.
 
-4. Restart CKAN. For example if you've deployed CKAN with Apache on Ubuntu:
+## Configuration
 
-        sudo service apache2 reload
+Set the following in your CKAN config file (`production.ini`) or via environment variables:
 
----------------------
-Configuration Options
----------------------
+```ini
+# The REST API URL of your GeoServer instance.
+# Default: http://localhost:8080/geoserver/rest
+ckanext.geoserver_client.rest_url = http://geoserver:8080/geoserver/rest
 
-Set the following options in your CKAN configuration file (``production.ini``) or via environment variables.
+# The admin username for GeoServer
+# Default: admin
+ckanext.geoserver_client.user = admin
 
-    # The REST API URL of your GeoServer instance.
-    # Default: http://localhost:8080/geoserver/rest
-    ckanext.geoserver_client.rest_url = http://geoserver:8080/geoserver/rest
+# The admin password for GeoServer
+# Default: geoserver
+ckanext.geoserver_client.password = my_secret_password
 
-    # The admin username for GeoServer
-    # Default: admin
-    ckanext.geoserver_client.user = admin
+# The target workspace in GeoServer where CKAN will publish layers
+# Default: ckan
+ckanext.geoserver_client.workspace = ckan
 
-    # The admin password for GeoServer
-    # Default: geoserver
-    ckanext.geoserver_client.password = my_secret_password
+# The public-facing GeoServer URL used to build WMS/WFS links on resources
+# Default: http://localhost:8080/geoserver
+ckanext.geoserver_client.public_url = http://geoserver:8080/geoserver
+```
 
-    # The target workspace in GeoServer where CKAN will publish layers
-    # Default: ckan
-    ckanext.geoserver_client.workspace = ckan
+**Environment variable equivalents** (for use with `ckanext-envvars`):
 
-    # The public-facing GeoServer URL used to build WMS/WFS links on resources
-    # Default: http://localhost:8080/geoserver
-    ckanext.geoserver_client.public_url = http://geoserver:8080/geoserver
+```bash
+CKANEXT__GEOSERVER_CLIENT__REST_URL=http://geoserver:8080/geoserver/rest
+CKANEXT__GEOSERVER_CLIENT__USER=admin
+CKANEXT__GEOSERVER_CLIENT__PASSWORD=my_secret_password
+CKANEXT__GEOSERVER_CLIENT__WORKSPACE=ckan
+CKANEXT__GEOSERVER_CLIENT__PUBLIC_URL=http://geoserver:8080/geoserver
+```
 
-**Environment variable equivalents** (for use with ``ckanext-envvars``)::
-
-    CKANEXT__GEOSERVER_CLIENT__REST_URL=http://geoserver:8080/geoserver/rest
-    CKANEXT__GEOSERVER_CLIENT__USER=admin
-    CKANEXT__GEOSERVER_CLIENT__PASSWORD=my_secret_password
-    CKANEXT__GEOSERVER_CLIENT__WORKSPACE=ckan
-    CKANEXT__GEOSERVER_CLIENT__PUBLIC_URL=http://geoserver:8080/geoserver
-
--------------
-How It Works
--------------
+## How It Works
 
 When a resource is **created or updated**, the plugin checks whether it is a GeoJSON resource. A resource is considered GeoJSON if either:
 
-- Its **format field** is set to ``GeoJSON`` (case-insensitive), or
-- Its **URL** ends with ``.geojson``
+- Its **format field** is set to `GeoJSON` (case-insensitive), or
+- Its **URL** ends with `.geojson`
 
 If either condition is met, a background job is enqueued that:
 
 1. Fetches the file (from local CKAN storage, S3/MinIO, or HTTP fallback)
 2. Validates the content is valid GeoJSON
-3. Converts it to a Shapefile using ``ogr2ogr``
+3. Converts it to a Shapefile using `ogr2ogr`
 4. Uploads the Shapefile to GeoServer and publishes it as a layer
-5. Optionally applies an SLD style if an ``SLD`` resource exists on the same dataset
-6. Updates the resource with ``wms_url``, ``wfs_url``, and ``geoserver_layer`` fields
+5. Optionally applies an SLD style if an `SLD` resource exists on the same dataset
+6. Updates the resource with `wms_url`, `wfs_url`, and `geoserver_layer` fields
 
 When a GeoJSON resource is **deleted**, the corresponding GeoServer layer is also removed.
 
-Publishing only happens automatically via the background worker. Make sure the CKAN worker process is running::
+Publishing only happens via the background worker. Make sure it is running:
 
-    ckan -c /etc/ckan/default/production.ini jobs worker
+```bash
+ckan -c /etc/ckan/default/production.ini jobs worker
+```
 
-----------------------
-Command Line Interface
-----------------------
+## CLI Commands
 
-The extension provides several CKAN CLI commands under the ``geoserver`` command for managing GeoServer publishing.
+**Initialize GeoServer workspace:**
 
-**Initialize GeoServer Workspace**
+```bash
+ckan -c /etc/ckan/default/production.ini geoserver init
+```
 
-Creates the configured GeoServer workspace if it does not already exist::
+**Publish a single resource:**
 
-    ckan -c /etc/ckan/default/production.ini geoserver init
+```bash
+ckan -c /etc/ckan/default/production.ini geoserver publish <resource_id>
+```
 
-**Publish a Single Resource**
+**Bulk publish all existing GeoJSON resources:**
 
-Downloads a CKAN GeoJSON resource, converts it to a shapefile, and publishes it natively as a layer inside GeoServer::
+```bash
+ckan -c /etc/ckan/default/production.ini geoserver publish-all
+```
 
-    ckan -c /etc/ckan/default/production.ini geoserver publish <resource_id>
+## Development
 
-**Bulk Publish Legacy Resources**
+```bash
+git clone https://github.com/datopian/ckanext-geoserver-client.git
+cd ckanext-geoserver-client
+python setup.py develop  # or: pip install -e .
+pip install -r dev-requirements.txt
+```
 
-Finds all existing GeoJSON resources in the CKAN database and automatically processes/publishes them into GeoServer::
+## Tests
 
-    ckan -c /etc/ckan/default/production.ini geoserver publish-all
+```bash
+pytest --ckan-ini=test.ini
 
-------------------------
-Development Installation
-------------------------
-
-To install ckanext-geoserver-client for development, activate your CKAN virtualenv and do::
-
-    git clone https://github.com/datopian/ckanext-geoserver-client.git
-    cd ckanext-geoserver-client
-    python setup.py develop
-    pip install -r dev-requirements.txt
-
-Note: ``pip install -e .`` is the modern equivalent of ``python setup.py develop``.
-
------------------
-Running the Tests
------------------
-
-To run the tests, do::
-
-    pytest --ckan-ini=test.ini 
-
-To run the tests and produce a coverage report, first make sure you have coverage installed in your virtualenv (``pip install coverage``) then run::
-
-    pytest --ckan-ini=test.ini --cov=ckanext.geoserver_client --disable-warnings ckanext/geoserver_client/tests
+# With coverage:
+pytest --ckan-ini=test.ini --cov=ckanext.geoserver_client --disable-warnings ckanext/geoserver_client/tests
+```
