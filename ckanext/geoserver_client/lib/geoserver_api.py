@@ -12,8 +12,12 @@ class GeoServerAPI(object):
             "ckanext.geoserver_client.rest_url", "http://localhost:8080/geoserver/rest"
         )
         self.user = toolkit.config.get("ckanext.geoserver_client.user", "admin")
-        self.password = toolkit.config.get("ckanext.geoserver_client.password", "geoserver")
-        self.workspace = toolkit.config.get("ckanext.geoserver_client.workspace", "ckan")
+        self.password = toolkit.config.get(
+            "ckanext.geoserver_client.password", "geoserver"
+        )
+        self.workspace = toolkit.config.get(
+            "ckanext.geoserver_client.workspace", "ckan"
+        )
 
     def _request(
         self,
@@ -28,7 +32,12 @@ class GeoServerAPI(object):
         headers = {"Accept": "application/json", "Content-type": content_type}
 
         response = requests.request(
-            method, url, auth=auth, headers=headers, json=json_data, data=file_data,
+            method,
+            url,
+            auth=auth,
+            headers=headers,
+            json=json_data,
+            data=file_data,
             timeout=30,
         )
         response.raise_for_status()
@@ -92,7 +101,9 @@ class GeoServerAPI(object):
         # Fall back to PUT to update the existing style.
         # Only fall back on "already exists" codes, not 400 Bad Request (invalid SLD).
         if res.status_code not in (403, 409, 500):
-            log.error(f"Style POST failed with {res.status_code} for {style_name!r}: {res.text}")
+            log.error(
+                f"Style POST failed with {res.status_code} for {style_name!r}: {res.text}"
+            )
             res.raise_for_status()
         log.debug(f"Style POST {res.status_code} for {style_name!r}, updating via PUT")
         put_url = f"{base}/workspaces/{self.workspace}/styles/{style_name}"
@@ -110,6 +121,16 @@ class GeoServerAPI(object):
             "layer": {"defaultStyle": {"name": style_name, "workspace": self.workspace}}
         }
         self._request("PUT", endpoint, json_data=payload)
+
+    def update_layer_title(self, resource_id, title):
+        endpoint = (
+            f"workspaces/{self.workspace}/datastores/{resource_id}"
+            f"/featuretypes/{resource_id}"
+        )
+        try:
+            self._request("PUT", endpoint, json_data={"featureType": {"title": title}})
+        except Exception as e:
+            log.warning(f"Could not update layer title for {resource_id}: {e}")
 
     def get_bounding_box(self, resource_id):
         endpoint = f"workspaces/{self.workspace}/datastores/{resource_id}/featuretypes/{resource_id}.json"

@@ -1,16 +1,43 @@
 import json
 import os
+import re
 import logging
 import tempfile
 import subprocess
 import zipfile
 import requests
 import shutil
-import urllib.parse
 from ckan import plugins as p
 from ckanext.geoserver_client.lib.geoserver_api import GeoServerAPI
 
 log = logging.getLogger(__name__)
+
+_ILLEGAL_XML_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitise_geojson(data):
+    if isinstance(data, dict):
+        return {k: _sanitise_geojson(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_sanitise_geojson(i) for i in data]
+    if isinstance(data, str):
+        return _ILLEGAL_XML_RE.sub("", data)
+    return data
+
+
+def _base_geometry_types(geojson_data):
+    """Return the set of base geometry types (Multi-prefix stripped) across all features."""
+    if geojson_data.get("type") == "FeatureCollection":
+        features = geojson_data.get("features", [])
+    else:
+        features = [geojson_data]
+    types = set()
+    for feat in features:
+        geom = feat.get("geometry") if feat.get("type") == "Feature" else feat
+        if geom:
+            t = geom.get("type", "")
+            types.add(t[5:] if t.startswith("Multi") else t)
+    return types
 
 
 def ingest_geojson_job(resource_id):
@@ -175,6 +202,23 @@ def geoserver_ingest_geojson(context, data_dict):
             )
             return {"status": "skipped", "reason": "File content is not valid GeoJSON"}
 
+        # Skip files with geometry types that shapefiles can't represent
+        base_types = _base_geometry_types(geojson_data)
+        if "GeometryCollection" in base_types or len(base_types) > 1:
+            log.warning(
+                f"Resource {resource_id} has unsupported geometry mix {base_types}, skipping"
+            )
+            return {
+                "status": "skipped",
+                "reason": f"Unsupported geometry types: {base_types}",
+            }
+
+        # Strip XML-illegal control characters from attribute values before
+        # handing to ogr2ogr — GeoServer's GML output will reject them.
+        geojson_data = _sanitise_geojson(geojson_data)
+        with open(geojson_path, "w", encoding="utf-8") as f:
+            json.dump(geojson_data, f)
+
         cmd = [
             "ogr2ogr",
             "-f",
@@ -206,6 +250,10 @@ def geoserver_ingest_geojson(context, data_dict):
         geoserver_api = GeoServerAPI()
         geoserver_api.upload_shapefile(resource_id, zip_path)
 
+        # Set a human-readable title on the layer from the CKAN resource name
+        layer_title = resource.get("name") or resource_id
+        geoserver_api.update_layer_title(resource_id, layer_title)
+
         base_url = p.toolkit.config.get(
             "ckanext.geoserver_client.public_url", "http://localhost:8080/geoserver"
         )
@@ -227,13 +275,15 @@ def geoserver_ingest_geojson(context, data_dict):
 
         if sld_res:
             try:
-                import re
-
                 sld_path = os.path.join(base_dir, f"style_{sld_res['id']}.sld")
                 _fetch_resource_file(sld_res, sld_path)
 
-                with open(sld_path, "r", encoding="utf-8") as f:
-                    sld_body = f.read()
+                with open(sld_path, "rb") as f:
+                    raw = f.read()
+                try:
+                    sld_body = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    sld_body = raw.decode("latin-1")
 
                 sld_body = re.sub(
                     r"(<NamedLayer>\s*<Name>)[^<]*(</Name>)",
@@ -253,16 +303,17 @@ def geoserver_ingest_geojson(context, data_dict):
                 )
 
         bbox = geoserver_api.get_bounding_box(resource_id)
-        bbox_param = f"&bbox={urllib.parse.quote(bbox)}" if bbox else ""
+        bbox_suffix = f"&bbox={bbox}" if bbox else ""
 
-        safe_layer = urllib.parse.quote(layer)
+        # Virtual OGC service URLs — scoped to this layer only so QGIS
+        # GetCapabilities returns exactly one layer instead of the whole workspace.
+        # layers/typeName let the portal frontend identify the layer without
+        # parsing the URL path; bbox drives the initial map zoom.
         resource["wms_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/wms?service=WMS&version=1.3.0"
-            f"&request=GetCapabilities&layers={safe_layer}{bbox_param}"
+            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wms?layers={layer}{bbox_suffix}"
         )
         resource["wfs_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/ows?service=WFS&version=2.0.0"
-            f"&request=GetFeature&typeName={safe_layer}&maxFeatures=50&outputFormat=gml3{bbox_param}"
+            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/ows?typeName={layer}{bbox_suffix}"
         )
         resource["geoserver_layer"] = layer
 
