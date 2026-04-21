@@ -310,10 +310,12 @@ def geoserver_ingest_geojson(context, data_dict):
         # layers/typeName let the portal frontend identify the layer without
         # parsing the URL path; bbox drives the initial map zoom.
         resource["wms_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wms?layers={layer}{bbox_suffix}"
+            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wms"
+            f"?service=WMS&request=GetCapabilities&layers={layer}{bbox_suffix}"
         )
         resource["wfs_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wfs?typeName={layer}{bbox_suffix}"
+            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wfs"
+            f"?service=WFS&request=GetCapabilities&typeName={layer}{bbox_suffix}"
         )
         resource["geoserver_layer"] = layer
 
