@@ -313,7 +313,7 @@ def geoserver_ingest_geojson(context, data_dict):
             f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wms?layers={layer}{bbox_suffix}"
         )
         resource["wfs_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/ows?typeName={layer}{bbox_suffix}"
+            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wfs?typeName={layer}{bbox_suffix}"
         )
         resource["geoserver_layer"] = layer
 
