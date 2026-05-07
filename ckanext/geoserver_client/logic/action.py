@@ -15,6 +15,15 @@ log = logging.getLogger(__name__)
 _ILLEGAL_XML_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+def _geoserver_name(resource_id):
+    """Return the GeoServer layer name for a resource.
+
+    XML names (used as WFS element names) cannot start with a digit, but CKAN
+    resource IDs are UUIDs which can begin with 0-9.  Prefix those with 'r_'.
+    """
+    return f"_{resource_id}" if resource_id and resource_id[0].isdigit() else resource_id
+
+
 def _sanitise_geojson(data):
     if isinstance(data, dict):
         return {k: _sanitise_geojson(v) for k, v in data.items()}
@@ -60,7 +69,7 @@ def delete_geoserver_layer_job(resource_id):
         from ckanext.geoserver_client.lib.geoserver_api import GeoServerAPI
 
         geoserver_api = GeoServerAPI()
-        geoserver_api.delete_layer(resource_id)
+        geoserver_api.delete_layer(_geoserver_name(resource_id))
     except Exception as e:
         log.error(
             f"Failed to cleanly proxy GeoServer layer removal for {resource_id}: {e}"
@@ -166,8 +175,9 @@ def geoserver_ingest_geojson(context, data_dict):
         return {"status": "skipped", "reason": "Not a GeoJSON file"}
 
     base_dir = tempfile.mkdtemp()
+    geoserver_name = _geoserver_name(resource_id)
     geojson_path = os.path.join(base_dir, f"{resource_id}.geojson")
-    shp_path = os.path.join(base_dir, f"{resource_id}.shp")
+    shp_path = os.path.join(base_dir, f"{geoserver_name}.shp")
     zip_path = os.path.join(base_dir, f"{resource_id}.zip")
 
     try:
@@ -226,7 +236,7 @@ def geoserver_ingest_geojson(context, data_dict):
             shp_path,
             geojson_path,
             "-nln",
-            resource_id,
+            geoserver_name,
             "-nlt",
             "PROMOTE_TO_MULTI",
             "-lco",
@@ -242,23 +252,23 @@ def geoserver_ingest_geojson(context, data_dict):
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
-                f = os.path.join(base_dir, f"{resource_id}{ext}")
+                f = os.path.join(base_dir, f"{geoserver_name}{ext}")
                 if os.path.exists(f):
                     zipf.write(f, os.path.basename(f))
 
         # Push the Shapefile to GeoServer, link WMS/WFS endpoints, apply SLD
         geoserver_api = GeoServerAPI()
-        geoserver_api.upload_shapefile(resource_id, zip_path)
+        geoserver_api.upload_shapefile(geoserver_name, zip_path)
 
         # Set a human-readable title on the layer from the CKAN resource name
         layer_title = resource.get("name") or resource_id
-        geoserver_api.update_layer_title(resource_id, layer_title)
+        geoserver_api.update_layer_title(geoserver_name, layer_title)
 
         base_url = p.toolkit.config.get(
             "ckanext.geoserver_client.public_url", "http://localhost:8080/geoserver"
         )
         workspace = geoserver_api.workspace
-        layer = f"{workspace}:{resource_id}"
+        layer = f"{workspace}:{geoserver_name}"
 
         # Check for SLD resources attached to the parent dataset
         dataset = p.toolkit.get_action("package_show")(
@@ -296,13 +306,13 @@ def geoserver_ingest_geojson(context, data_dict):
                 style_name = f"style_{resource_id}"
 
                 if geoserver_api.upload_style(style_name, sld_body):
-                    geoserver_api.set_layer_style(resource_id, style_name)
+                    geoserver_api.set_layer_style(geoserver_name, style_name)
             except Exception as e:
                 log.error(
                     f"Failed to cleanly apply SLD style {sld_res.get('id')} to {resource_id}: {e}"
                 )
 
-        bbox = geoserver_api.get_bounding_box(resource_id)
+        bbox = geoserver_api.get_bounding_box(geoserver_name)
         bbox_suffix = f"&bbox={bbox}" if bbox else ""
 
         # Virtual OGC service URLs — scoped to this layer only so QGIS
@@ -310,11 +320,11 @@ def geoserver_ingest_geojson(context, data_dict):
         # layers/typeName let the portal frontend identify the layer without
         # parsing the URL path; bbox drives the initial map zoom.
         resource["wms_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wms"
+            f"{base_url.rstrip('/')}/{workspace}/{geoserver_name}/wms"
             f"?service=WMS&request=GetCapabilities&layers={layer}{bbox_suffix}"
         )
         resource["wfs_url"] = (
-            f"{base_url.rstrip('/')}/{workspace}/{resource_id}/wfs"
+            f"{base_url.rstrip('/')}/{workspace}/{geoserver_name}/wfs"
             f"?service=WFS&request=GetCapabilities&typeName={layer}{bbox_suffix}"
         )
         resource["geoserver_layer"] = layer
