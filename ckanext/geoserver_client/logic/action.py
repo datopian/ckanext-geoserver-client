@@ -21,7 +21,7 @@ def _geoserver_name(resource_id):
     XML names (used as WFS element names) cannot start with a digit, but CKAN
     resource IDs are UUIDs which can begin with 0-9.  Prefix those with 'r_'.
     """
-    return f"_{resource_id}" if resource_id and resource_id[0].isdigit() else resource_id
+    return f"r_{resource_id}"
 
 
 def _sanitise_geojson(data):
