@@ -40,12 +40,16 @@ def _base_geometry_types(geojson_data):
         features = geojson_data.get("features", [])
     else:
         features = [geojson_data]
+
     types = set()
+
     for feat in features:
         geom = feat.get("geometry") if feat.get("type") == "Feature" else feat
+
         if geom:
             t = geom.get("type", "")
             types.add(t[5:] if t.startswith("Multi") else t)
+
     return types
 
 
@@ -56,6 +60,7 @@ def ingest_geojson_job(resource_id):
             "name"
         ],
     }
+
     try:
         p.toolkit.get_action("geoserver_ingest_geojson")(
             context, {"resource_id": resource_id}
@@ -76,7 +81,7 @@ def delete_geoserver_layer_job(resource_id):
         )
 
 
-def _fetch_resource_file(resource, dest_path):
+def _fetch_resource_file(resource, dest_path, api_token=None):
     """
     Fetch a resource file
     """
@@ -95,6 +100,7 @@ def _fetch_resource_file(resource, dest_path):
             resource_id[3:6],
             resource_id[6:],
         )
+
         if os.path.isfile(local_path):
             log.debug(f"Reading {resource_id} directly from disk: {local_path}")
             shutil.copy2(local_path, dest_path)
@@ -133,8 +139,17 @@ def _fetch_resource_file(resource, dest_path):
 
             nested_key = f"{storage_path}/{resource_id[0:3]}/{resource_id[3:6]}/{resource_id[6:]}"
             flat_key = f"{storage_path}/{resource_id}"
+            filename = url.rstrip("/").split("/")[-1] if url else ""
+            subdir_key = (
+                f"{storage_path}/{resource_id}/{filename}" if filename else None
+            )
 
-            for object_key in (nested_key, flat_key):
+            keys_to_try = [nested_key, flat_key]
+
+            if subdir_key:
+                keys_to_try.append(subdir_key)
+
+            for object_key in keys_to_try:
                 try:
                     log.debug(f"Trying s3://{bucket}/{object_key}")
                     s3.download_file(bucket, object_key, dest_path)
@@ -148,7 +163,12 @@ def _fetch_resource_file(resource, dest_path):
 
     # Fallback to HTTP fetch if all else fails
     log.debug(f"Falling back to HTTP fetch for {resource_id}: {url}")
-    resp = requests.get(url, stream=True, timeout=30)
+    headers = {}
+
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    resp = requests.get(url, stream=True, timeout=30, headers=headers)
     resp.raise_for_status()
 
     with open(dest_path, "wb") as f:
@@ -162,93 +182,185 @@ def _fetch_resource_file(resource, dest_path):
 
 def geoserver_ingest_geojson(context, data_dict):
     """
-    Ingest a GeoJSON resource, convert to Shapefile, and publish to GeoServer
-    with optional SLD styling if attached to the parent dataset.
+    Ingest a GeoJSON, Shapefile (ZIP), or GeoPackage resource, convert to
+    Shapefile if needed, and publish to GeoServer with optional SLD styling.
     """
     p.toolkit.check_access("package_update", context, data_dict)
     resource_id = p.toolkit.get_or_bust(data_dict, "resource_id")
     resource = p.toolkit.get_action("resource_show")(context, {"id": resource_id})
-    url = resource.get("url")
+    url = resource.get("url") or ""
     fmt = resource.get("format", "").lower()
+    url_lower = url.lower()
 
-    if not url or (fmt != "geojson" and not url.lower().endswith(".geojson")):
-        return {"status": "skipped", "reason": "Not a GeoJSON file"}
+    is_geojson = fmt == "geojson" or url_lower.endswith(".geojson")
+    is_shapefile = fmt in ("shp", "shapefile", "shape") or url_lower.endswith(".shp")
+    is_zip = fmt == "zip" or url_lower.endswith(".zip")
+    is_gpkg = fmt in ("gpkg", "geopackage") or url_lower.endswith(".gpkg")
+
+    if not url or not (is_geojson or is_shapefile or is_zip or is_gpkg):
+        return {"status": "skipped", "reason": "Not a supported geo format"}
 
     base_dir = tempfile.mkdtemp()
     geoserver_name = _geoserver_name(resource_id)
-    geojson_path = os.path.join(base_dir, f"{resource_id}.geojson")
     shp_path = os.path.join(base_dir, f"{geoserver_name}.shp")
     zip_path = os.path.join(base_dir, f"{resource_id}.zip")
+    api_token = context.get("api_token")
 
     try:
-        _fetch_resource_file(resource, geojson_path)
+        if is_geojson:
+            geojson_path = os.path.join(base_dir, f"{resource_id}.geojson")
+            _fetch_resource_file(resource, geojson_path, api_token=api_token)
 
-        # Validate the file is actually GeoJSON before handing to ogr2ogr
-        try:
-            with open(geojson_path, "r", encoding="utf-8-sig") as f:
-                geojson_data = json.load(f)
-            valid_types = {
-                "FeatureCollection",
-                "Feature",
-                "Point",
-                "MultiPoint",
-                "LineString",
-                "MultiLineString",
-                "Polygon",
-                "MultiPolygon",
-                "GeometryCollection",
-            }
-            if geojson_data.get("type") not in valid_types:
+            # Validate the file is actually GeoJSON before handing to ogr2ogr
+            try:
+                with open(geojson_path, "r", encoding="utf-8-sig") as f:
+                    geojson_data = json.load(f)
+                valid_types = {
+                    "FeatureCollection",
+                    "Feature",
+                    "Point",
+                    "MultiPoint",
+                    "LineString",
+                    "MultiLineString",
+                    "Polygon",
+                    "MultiPolygon",
+                    "GeometryCollection",
+                }
+                if geojson_data.get("type") not in valid_types:
+                    log.warning(
+                        f"Resource {resource_id} has format=geojson but file is not valid GeoJSON (type={geojson_data.get('type')!r}), skipping"
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "File content is not valid GeoJSON",
+                    }
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 log.warning(
-                    f"Resource {resource_id} has format=geojson but file is not valid GeoJSON (type={geojson_data.get('type')!r}), skipping"
+                    f"Resource {resource_id} has format=geojson but file could not be parsed as JSON: {e}, skipping"
                 )
                 return {
                     "status": "skipped",
                     "reason": "File content is not valid GeoJSON",
                 }
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            log.warning(
-                f"Resource {resource_id} has format=geojson but file could not be parsed as JSON: {e}, skipping"
-            )
-            return {"status": "skipped", "reason": "File content is not valid GeoJSON"}
 
-        # Skip files with geometry types that shapefiles can't represent
-        base_types = _base_geometry_types(geojson_data)
-        if "GeometryCollection" in base_types or len(base_types) > 1:
-            log.warning(
-                f"Resource {resource_id} has unsupported geometry mix {base_types}, skipping"
-            )
-            return {
-                "status": "skipped",
-                "reason": f"Unsupported geometry types: {base_types}",
-            }
+            # Skip files with geometry types that shapefiles can't represent
+            base_types = _base_geometry_types(geojson_data)
 
-        # Strip XML-illegal control characters from attribute values before
-        # handing to ogr2ogr — GeoServer's GML output will reject them.
-        geojson_data = _sanitise_geojson(geojson_data)
-        with open(geojson_path, "w", encoding="utf-8") as f:
-            json.dump(geojson_data, f)
+            if "GeometryCollection" in base_types or len(base_types) > 1:
+                log.warning(
+                    f"Resource {resource_id} has unsupported geometry mix {base_types}, skipping"
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"Unsupported geometry types: {base_types}",
+                }
 
-        cmd = [
-            "ogr2ogr",
-            "-f",
-            "ESRI Shapefile",
-            shp_path,
-            geojson_path,
-            "-nln",
-            geoserver_name,
-            "-nlt",
-            "PROMOTE_TO_MULTI",
-            "-lco",
-            "ENCODING=UTF-8",
-            "-overwrite",
-        ]
+            # Strip XML-illegal control characters from attribute values before
+            # handing to ogr2ogr — GeoServer's GML output will reject them.
+            geojson_data = _sanitise_geojson(geojson_data)
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            with open(geojson_path, "w", encoding="utf-8") as f:
+                json.dump(geojson_data, f)
 
-        if proc.returncode != 0:
-            log.error(f"ogr2ogr conversion to shapefile failed: {proc.stderr}")
-            raise Exception(f"ogr2ogr conversion failed: {proc.stderr}")
+            cmd = [
+                "ogr2ogr",
+                "-f",
+                "ESRI Shapefile",
+                shp_path,
+                geojson_path,
+                "-nln",
+                geoserver_name,
+                "-nlt",
+                "PROMOTE_TO_MULTI",
+                "-lco",
+                "ENCODING=UTF-8",
+                "-overwrite",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+
+            if proc.returncode != 0:
+                log.error(f"ogr2ogr conversion to shapefile failed: {proc.stderr}")
+                raise Exception(f"ogr2ogr conversion failed: {proc.stderr}")
+
+        elif is_shapefile or is_zip:
+            raw_path = os.path.join(base_dir, "input")
+            _fetch_resource_file(resource, raw_path, api_token=api_token)
+
+            input_shp = None
+
+            try:
+                extract_dir = os.path.join(base_dir, "extracted")
+                os.makedirs(extract_dir)
+
+                with zipfile.ZipFile(raw_path, "r") as zf:
+                    zf.extractall(extract_dir)
+
+                shp_files = [
+                    os.path.join(extract_dir, f)
+                    for f in os.listdir(extract_dir)
+                    if f.lower().endswith(".shp")
+                ]
+
+                if not shp_files:
+                    return {
+                        "status": "skipped",
+                        "reason": "ZIP does not contain a shapefile",
+                    }
+                input_shp = shp_files[0]
+            except zipfile.BadZipFile:
+                if not is_shapefile:
+                    return {
+                        "status": "skipped",
+                        "reason": "ZIP file is corrupt or invalid",
+                    }
+                # format=SHP but not a zip — try using the file directly
+                input_shp = raw_path
+
+            cmd = [
+                "ogr2ogr",
+                "-f",
+                "ESRI Shapefile",
+                shp_path,
+                input_shp,
+                "-nln",
+                geoserver_name,
+                "-nlt",
+                "PROMOTE_TO_MULTI",
+                "-lco",
+                "ENCODING=UTF-8",
+                "-overwrite",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+
+            if proc.returncode != 0:
+                log.error(f"ogr2ogr shapefile normalisation failed: {proc.stderr}")
+                raise Exception(
+                    f"ogr2ogr shapefile normalisation failed: {proc.stderr}"
+                )
+
+        else:  # is_gpkg
+            gpkg_path = os.path.join(base_dir, f"{resource_id}.gpkg")
+            _fetch_resource_file(resource, gpkg_path, api_token=api_token)
+
+            cmd = [
+                "ogr2ogr",
+                "-f",
+                "ESRI Shapefile",
+                shp_path,
+                gpkg_path,
+                "-nln",
+                geoserver_name,
+                "-nlt",
+                "PROMOTE_TO_MULTI",
+                "-lco",
+                "ENCODING=UTF-8",
+                "-overwrite",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+
+            if proc.returncode != 0:
+                log.error(f"ogr2ogr GeoPackage conversion failed: {proc.stderr}")
+                raise Exception(f"ogr2ogr GeoPackage conversion failed: {proc.stderr}")
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
@@ -286,7 +398,7 @@ def geoserver_ingest_geojson(context, data_dict):
         if sld_res:
             try:
                 sld_path = os.path.join(base_dir, f"style_{sld_res['id']}.sld")
-                _fetch_resource_file(sld_res, sld_path)
+                _fetch_resource_file(sld_res, sld_path, api_token=api_token)
 
                 with open(sld_path, "rb") as f:
                     raw = f.read()
@@ -335,7 +447,7 @@ def geoserver_ingest_geojson(context, data_dict):
         return {"status": "success", "resource_id": resource_id}
 
     except Exception as e:
-        log.error(f"Failed to cleanly proxy GeoJSON: {e}")
+        log.error(f"Failed to ingest geo resource {resource_id}: {e}")
         raise p.toolkit.ValidationError({"ogr2ogr_shapefile_error": str(e)})
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)

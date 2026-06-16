@@ -25,7 +25,7 @@ class GeoServerPlugin(p.SingletonPlugin):
         self._enqueue_geoserver_job(resource)
 
     def after_resource_delete(self, context, resource):
-        if self._is_geojson_resource(resource):
+        if self._is_geo_resource(resource):
             from ckanext.geoserver_client.logic.action import delete_geoserver_layer_job
 
             try:
@@ -37,13 +37,19 @@ class GeoServerPlugin(p.SingletonPlugin):
             except Exception as e:
                 log.error("Failed to enqueue GeoServer delete payload queue: %s", e)
 
-    def _is_geojson_resource(self, resource):
+    def _is_geo_resource(self, resource):
         url = resource.get("url", "").lower()
         fmt = resource.get("format", "").lower()
-        return fmt == "geojson" or url.endswith(".geojson")
+        return (
+            fmt in ("geojson", "shp", "shapefile", "shape", "zip", "gpkg", "geopackage")
+            or url.endswith(".geojson")
+            or url.endswith(".shp")
+            or url.endswith(".zip")
+            or url.endswith(".gpkg")
+        )
 
     def _enqueue_geoserver_job(self, resource):
-        if self._is_geojson_resource(resource):
+        if self._is_geo_resource(resource):
             from ckanext.geoserver_client.logic.action import ingest_geojson_job
 
             try:

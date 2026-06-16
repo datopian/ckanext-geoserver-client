@@ -24,7 +24,7 @@ def init():
 @geoserver.command()
 @click.argument("resource_id")
 def publish(resource_id):
-    """Ingest and publish a single CKAN GeoJSON resource to GeoServer."""
+    """Ingest and publish a single CKAN geo resource to GeoServer."""
     try:
         context = {"ignore_auth": True}
         result = toolkit.get_action("geoserver_ingest_geojson")(
@@ -40,7 +40,7 @@ def publish(resource_id):
 
 @geoserver.command("publish-all")
 def publish_all():
-    """Ingest and Publish all existing GeoJSON resources to GeoServer."""
+    """Ingest and publish all existing GeoJSON, Shapefile, and GeoPackage resources to GeoServer."""
     temp_token = None
     sysadmin = None
     try:
@@ -96,11 +96,18 @@ def publish_all():
             fmt = (fmt or "").lower()
             url = (url or "").lower()
             # Catch legacy resources based on format or URL regardless of Datastore
-            if fmt == "geojson" or url.endswith(".geojson"):
+            if (
+                fmt
+                in ("geojson", "shp", "shapefile", "shape", "zip", "gpkg", "geopackage")
+                or url.endswith(".geojson")
+                or url.endswith(".shp")
+                or url.endswith(".zip")
+                or url.endswith(".gpkg")
+            ):
                 geojson_resources.append(res_id)
 
         click.secho(
-            f"Found {len(geojson_resources)} existing GeoJSON resources. Starting migration...",
+            f"Found {len(geojson_resources)} existing geo resources. Starting migration...",
             fg="blue",
         )
         success_count = 0
