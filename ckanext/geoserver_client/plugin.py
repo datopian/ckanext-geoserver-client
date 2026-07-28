@@ -24,7 +24,13 @@ class GeoServerPlugin(p.SingletonPlugin):
             return
         self._enqueue_geoserver_job(resource)
 
-    def after_resource_delete(self, context, resource):
+    def before_resource_delete(self, context, resource, resources):
+        # NOT after_resource_delete: that hook receives the list of
+        # resources still remaining on the package after the delete, not
+        # the one being deleted - there'd be no way to get this resource's
+        # id/url/format from it, since it's already gone from that list.
+        # before_resource_delete gives us the resource being deleted itself,
+        # while it still exists.
         if self._is_geo_resource(resource):
             from ckanext.geoserver_client.logic.action import delete_geoserver_layer_job
 
