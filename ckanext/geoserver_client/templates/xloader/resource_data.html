@@ -1,9 +1,0 @@
-{% ckan_extends %}
-
-{% block primary_content_inner %}
-  {% if h.geoserver_client_is_geojson_resource(res) %}
-    {% include "geoserver_client/snippets/datastore_status.html" %}
-  {% else %}
-    {{ super() }}
-  {% endif %}
-{% endblock %}
