@@ -69,6 +69,83 @@ def ingest_geojson_job(resource_id):
         log.error(f"Background shapefile ingest failed for {resource_id}: {e}")
 
 
+def datastore_geojson_job(resource_id):
+    """Background job: load a GeoJSON resource into the DataStore with
+    native PostGIS geometry columns. Independent of (runs alongside, not
+    instead of) the GeoServer-publishing job above - one makes the data
+    queryable via the DataStore API, the other makes it servable as a map
+    layer; a GeoJSON upload gets both.
+
+    Records progress/outcome via lib/task_status.py so the resource's
+    DataStore tab (templates/xloader and templates/datapusher's overridden
+    resource_data.html) has something real to show instead of DataPusher's
+    own "Not uploaded yet" - this job (not DataPusher/xloader, which don't
+    understand GeoJSON at all) is what actually populates the DataStore
+    for these resources.
+    """
+    from ckanext.geoserver_client.lib import task_status
+    from ckanext.geoserver_client.lib.datastore import load_geojson_to_datastore
+
+    task_status.start(resource_id)
+    tmp_dir = tempfile.mkdtemp()
+
+    def _get_resource_file(rid):
+        resource = p.toolkit.get_action("resource_show")(
+            {"ignore_auth": True}, {"id": rid}
+        )
+        dest = os.path.join(tmp_dir, f"{rid}.geojson")
+        _fetch_resource_file(resource, dest)
+        return open(dest, "rb")
+
+    try:
+        result = load_geojson_to_datastore(
+            resource_id,
+            get_resource_file=_get_resource_file,
+            on_progress=lambda message: task_status.log_step(resource_id, message),
+        )
+        if result.get("status") == "skipped":
+            task_status.skip(resource_id, result.get("reason") or "Skipped")
+        else:
+            task_status.complete(resource_id)
+    except Exception as e:
+        log.error(f"Background datastore load failed for {resource_id}: {e}")
+        task_status.error(resource_id, str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@p.toolkit.side_effect_free
+def geoserver_client_datastore_status(context, data_dict):
+    """Status of our own GeoJSON-to-DataStore job for a resource, in the
+    same shape as ckanext-datapusher's datapusher_status action, so the
+    overridden resource_data.html template can be reused almost as-is.
+    """
+    resource_id = p.toolkit.get_or_bust(data_dict, "id")
+    p.toolkit.check_access("package_show", context, {"id": resource_id})
+    from ckanext.geoserver_client.lib import task_status
+
+    return task_status.get_status(resource_id)
+
+
+def geoserver_client_datastore_submit(context, data_dict):
+    """(Re-)submit a GeoJSON resource to our own DataStore-loading pipeline.
+    This is what the DataStore tab's "Upload to DataStore" button calls for
+    GeoJSON resources, instead of DataPusher/xloader's own submit action
+    (which don't know how to load GeoJSON at all).
+    """
+    resource_id = p.toolkit.get_or_bust(data_dict, "resource_id")
+    p.toolkit.check_access("package_update", context, {"id": resource_id})
+    from ckanext.geoserver_client.lib import task_status
+
+    task_status.start(resource_id)
+    p.toolkit.enqueue_job(
+        datastore_geojson_job,
+        [resource_id],
+        title=f"Loading GeoJSON {resource_id} into the datastore",
+    )
+    return {"resource_id": resource_id}
+
+
 def delete_geoserver_layer_job(resource_id):
     try:
         from ckanext.geoserver_client.lib.geoserver_api import GeoServerAPI
@@ -123,8 +200,13 @@ def _fetch_resource_file(resource, dest_path, api_token=None):
             "ckanext.s3filestore.host_name"
         ) or toolkit.config.get("ckanext.s3filestore.aws_host_name")
         region = toolkit.config.get("ckanext.s3filestore.region_name", "us-east-1")
+        # ckanext-s3filestore's S3ResourceUploader always keys resources as
+        # <aws_storage_path>/resources/<resource_id>/<filename> (storage_path
+        # defaults to '' when unset, NOT 'resources' - that default text was
+        # only ever a coincidental match for the no-config case, since it
+        # never appended a further 'resources' segment on top of it).
         storage_path = toolkit.config.get(
-            "ckanext.s3filestore.aws_storage_path", "resources"
+            "ckanext.s3filestore.aws_storage_path", ""
         ).strip("/")
 
         if bucket and key_id and secret and endpoint:
@@ -137,17 +219,27 @@ def _fetch_resource_file(resource, dest_path, api_token=None):
                 config=Config(signature_version="s3v4"),
             )
 
+            filename = url.rstrip("/").split("/")[-1] if url else ""
+
+            # The real key ckanext-s3filestore actually uses - tried first.
+            s3filestore_key = (
+                "/".join(
+                    filter(None, [storage_path, "resources", resource_id, filename])
+                )
+                if filename
+                else None
+            )
+            # Older/alternate layouts, kept as fallbacks in case a resource
+            # was stored under a different convention.
             nested_key = f"{storage_path}/{resource_id[0:3]}/{resource_id[3:6]}/{resource_id[6:]}"
             flat_key = f"{storage_path}/{resource_id}"
-            filename = url.rstrip("/").split("/")[-1] if url else ""
             subdir_key = (
                 f"{storage_path}/{resource_id}/{filename}" if filename else None
             )
 
-            keys_to_try = [nested_key, flat_key]
-
-            if subdir_key:
-                keys_to_try.append(subdir_key)
+            keys_to_try = [
+                k for k in (s3filestore_key, nested_key, flat_key, subdir_key) if k
+            ]
 
             for object_key in keys_to_try:
                 try:

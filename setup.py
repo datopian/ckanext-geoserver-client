@@ -14,6 +14,8 @@ setup(
     zip_safe=False,
     install_requires=[
         'requests',
+        'geomet',
+        'geojson',
     ],
     entry_points='''
         [ckan.plugins]
