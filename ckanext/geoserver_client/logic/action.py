@@ -123,8 +123,13 @@ def _fetch_resource_file(resource, dest_path, api_token=None):
             "ckanext.s3filestore.host_name"
         ) or toolkit.config.get("ckanext.s3filestore.aws_host_name")
         region = toolkit.config.get("ckanext.s3filestore.region_name", "us-east-1")
+        # ckanext-s3filestore's S3ResourceUploader always keys resources as
+        # <aws_storage_path>/resources/<resource_id>/<filename> (storage_path
+        # defaults to '' when unset, NOT 'resources' - that default text was
+        # only ever a coincidental match for the no-config case, since it
+        # never appended a further 'resources' segment on top of it).
         storage_path = toolkit.config.get(
-            "ckanext.s3filestore.aws_storage_path", "resources"
+            "ckanext.s3filestore.aws_storage_path", ""
         ).strip("/")
 
         if bucket and key_id and secret and endpoint:
@@ -137,17 +142,23 @@ def _fetch_resource_file(resource, dest_path, api_token=None):
                 config=Config(signature_version="s3v4"),
             )
 
+            filename = url.rstrip("/").split("/")[-1] if url else ""
+
+            # The real key ckanext-s3filestore actually uses - tried first.
+            s3filestore_key = (
+                "/".join(filter(None, [storage_path, "resources", resource_id, filename]))
+                if filename
+                else None
+            )
+            # Older/alternate layouts, kept as fallbacks in case a resource
+            # was stored under a different convention.
             nested_key = f"{storage_path}/{resource_id[0:3]}/{resource_id[3:6]}/{resource_id[6:]}"
             flat_key = f"{storage_path}/{resource_id}"
-            filename = url.rstrip("/").split("/")[-1] if url else ""
             subdir_key = (
                 f"{storage_path}/{resource_id}/{filename}" if filename else None
             )
 
-            keys_to_try = [nested_key, flat_key]
-
-            if subdir_key:
-                keys_to_try.append(subdir_key)
+            keys_to_try = [k for k in (s3filestore_key, nested_key, flat_key, subdir_key) if k]
 
             for object_key in keys_to_try:
                 try:
