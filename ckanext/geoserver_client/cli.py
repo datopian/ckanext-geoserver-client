@@ -38,6 +38,88 @@ def publish(resource_id):
         click.secho(f"Error publishing resource: {e}", fg="red")
 
 
+@geoserver.command()
+@click.argument("resource_id")
+def unpublish(resource_id):
+    """Remove the GeoServer datastore/layer and style of a single resource.
+
+    Does not change the CKAN resource. Works for resources that no longer
+    exist in CKAN too.
+    """
+    from ckanext.geoserver_client.logic.action import delete_geoserver_layer_job
+
+    delete_geoserver_layer_job(resource_id)
+    click.secho(
+        f"Done: GeoServer objects for {resource_id} removed (see CKAN logs for errors).",
+        fg="green",
+    )
+
+
+@geoserver.command("cleanup-orphans")
+@click.option(
+    "--yes",
+    is_flag=True,
+    default=False,
+    help="Actually delete the orphans found. Without this flag, only reports them.",
+)
+def cleanup_orphans(yes):
+    """Find GeoServer datastores/styles left behind by resources that no
+    longer exist in CKAN, are deleted, or belong to a deleted dataset; styles
+    whose dataset no longer has an SLD resource; and legacy-named datastores
+    superseded by a republish.
+
+    Reports what it finds by default. Pass --yes to delete them.
+    """
+    context = {"ignore_auth": True}
+
+    try:
+        orphans = toolkit.get_action("geoserver_find_orphans")(context, {})
+    except Exception as e:
+        click.secho(f"Error scanning for orphans: {e}", fg="red")
+        return
+
+    datastores = orphans.get("orphaned_datastores", [])
+    styles = orphans.get("orphaned_styles", [])
+
+    if not datastores and not styles:
+        click.secho("No orphaned GeoServer datastores or styles found.", fg="green")
+        return
+
+    click.secho(f"Found {len(datastores)} orphaned datastore(s):", fg="yellow")
+    for name in datastores:
+        click.echo(f"  - {name}")
+
+    click.secho(f"Found {len(styles)} orphaned style(s):", fg="yellow")
+    for name in styles:
+        click.echo(f"  - {name}")
+
+    if not yes:
+        click.secho(
+            "\nDry run only - nothing deleted. Rerun with --yes to delete these.",
+            fg="blue",
+        )
+        return
+
+    click.secho("\nDeleting...", fg="yellow")
+    try:
+        result = toolkit.get_action("geoserver_delete_orphans")(context, orphans)
+    except Exception as e:
+        click.secho(f"Error deleting orphans: {e}", fg="red")
+        return
+
+    click.secho(
+        f"Deleted {len(result['deleted_datastores'])} datastore(s), "
+        f"{len(result['deleted_styles'])} style(s).",
+        fg="green",
+    )
+    if result["failed_datastores"] or result["failed_styles"]:
+        click.secho(
+            f"Failed: {result['failed_datastores'] + result['failed_styles']} "
+            "- see CKAN logs for details.",
+            fg="red",
+        )
+
+
 @geoserver.command("publish-all")
 def publish_all():
     """Ingest and publish all existing GeoJSON, Shapefile, and GeoPackage resources to GeoServer."""

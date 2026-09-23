@@ -69,15 +69,41 @@ def ingest_geojson_job(resource_id):
         log.error(f"Background shapefile ingest failed for {resource_id}: {e}")
 
 
+def _legacy_geoserver_names(resource_id):
+    """Datastore names used by older versions of _geoserver_name: the raw
+    resource_id, then '_' + resource_id for ids starting with a digit.
+    Resources published before the 'r_' prefix may still use these.
+    """
+    return [resource_id, f"_{resource_id}"]
+
+
 def delete_geoserver_layer_job(resource_id):
     try:
-        from ckanext.geoserver_client.lib.geoserver_api import GeoServerAPI
-
         geoserver_api = GeoServerAPI()
-        geoserver_api.delete_layer(_geoserver_name(resource_id))
+    except Exception as e:
+        log.error(f"Failed to create GeoServer client for {resource_id}: {e}")
+        return
+
+    # Delete the current name and any legacy names. delete_layer ignores 404,
+    # so names that do not exist cost one request each and nothing else.
+    for name in [_geoserver_name(resource_id)] + _legacy_geoserver_names(resource_id):
+        try:
+            geoserver_api.delete_layer(name)
+        except Exception as e:
+            log.error(
+                f"Failed to cleanly proxy GeoServer layer removal for {name}: {e}"
+            )
+
+    # The style is a separate workspace-level catalog object, named after the
+    # raw resource_id (not the r_-prefixed layer name; see the style_name
+    # assignment in geoserver_ingest_geojson). Deleting the datastore above
+    # does not remove it, so it must be cleaned up on its own or it is
+    # orphaned in GeoServer forever.
+    try:
+        geoserver_api.delete_style(f"style_{resource_id}")
     except Exception as e:
         log.error(
-            f"Failed to cleanly proxy GeoServer layer removal for {resource_id}: {e}"
+            f"Failed to cleanly remove GeoServer style for {resource_id}: {e}"
         )
 
 
@@ -189,6 +215,97 @@ def _fetch_resource_file(resource, dest_path, api_token=None):
     # Final check: ensure the file actually exists and is not empty
     if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
         raise Exception(f"Failed to fetch content for resource {resource_id}")
+
+
+def _is_sld(resource):
+    return (resource.get("format") or "").lower() == "sld"
+
+
+def _dataset_sld(dataset):
+    """The SLD resource used to style every geo layer in the dataset: the
+    first active resource with format SLD, or None.
+    """
+    return next((r for r in dataset.get("resources", []) if _is_sld(r)), None)
+
+
+def _sync_layer_style(
+    geoserver_api, resource_id, layer_name, sld_res, base_dir, api_token=None
+):
+    """Make the layer's style match the dataset's SLD.
+
+    With an SLD: upload it as style_<resource_id> and set it as the layer's
+    default style. Without one: delete style_<resource_id>. GeoServer then
+    resets the layer to its built-in default style (see delete_style).
+    Errors are logged, not raised, so a style problem never fails ingest.
+    """
+    style_name = f"style_{resource_id}"
+
+    if not sld_res:
+        try:
+            geoserver_api.delete_style(style_name)
+        except Exception as e:
+            log.error(f"Failed to remove GeoServer style {style_name}: {e}")
+        return
+
+    try:
+        sld_path = os.path.join(base_dir, f"style_{sld_res['id']}.sld")
+        _fetch_resource_file(sld_res, sld_path, api_token=api_token)
+
+        with open(sld_path, "rb") as f:
+            raw = f.read()
+        try:
+            sld_body = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            sld_body = raw.decode("latin-1")
+
+        layer = f"{geoserver_api.workspace}:{layer_name}"
+        sld_body = re.sub(
+            r"(<NamedLayer>\s*<Name>)[^<]*(</Name>)",
+            lambda m: f"{m.group(1)}{layer}{m.group(2)}",
+            sld_body,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+        if geoserver_api.upload_style(style_name, sld_body):
+            geoserver_api.set_layer_style(layer_name, style_name)
+    except Exception as e:
+        log.error(
+            f"Failed to cleanly apply SLD style {sld_res.get('id')} to {resource_id}: {e}"
+        )
+
+
+def refresh_dataset_styles_job(package_id):
+    """Re-sync the style of every published geo layer in a dataset after an
+    SLD resource was created, changed or deleted. Only styles change; the
+    data is not re-uploaded.
+    """
+    context = {
+        "ignore_auth": True,
+        "user": p.toolkit.get_action("get_site_user")({"ignore_auth": True}, {})[
+            "name"
+        ],
+    }
+    try:
+        dataset = p.toolkit.get_action("package_show")(context, {"id": package_id})
+    except p.toolkit.ObjectNotFound:
+        return
+
+    geoserver_api = GeoServerAPI()
+    sld_res = _dataset_sld(dataset)
+    base_dir = tempfile.mkdtemp()
+    try:
+        for res in dataset.get("resources", []):
+            # geoserver_layer is "<workspace>:<layer name>", set on ingest.
+            # Resources without it were never published, so skip them.
+            layer = res.get("geoserver_layer") or ""
+            if ":" not in layer:
+                continue
+            _sync_layer_style(
+                geoserver_api, res["id"], layer.split(":", 1)[1], sld_res, base_dir
+            )
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
 
 
 def geoserver_ingest_geojson(context, data_dict):
@@ -393,47 +510,18 @@ def geoserver_ingest_geojson(context, data_dict):
         workspace = geoserver_api.workspace
         layer = f"{workspace}:{geoserver_name}"
 
-        # Check for SLD resources attached to the parent dataset
+        # Apply the dataset's SLD, or remove a stale style if it has none
         dataset = p.toolkit.get_action("package_show")(
             context, {"id": resource.get("package_id")}
         )
-        sld_res = next(
-            (
-                r
-                for r in dataset.get("resources", [])
-                if r.get("format", "").lower() == "sld"
-            ),
-            None,
+        _sync_layer_style(
+            geoserver_api,
+            resource_id,
+            geoserver_name,
+            _dataset_sld(dataset),
+            base_dir,
+            api_token=api_token,
         )
-
-        if sld_res:
-            try:
-                sld_path = os.path.join(base_dir, f"style_{sld_res['id']}.sld")
-                _fetch_resource_file(sld_res, sld_path, api_token=api_token)
-
-                with open(sld_path, "rb") as f:
-                    raw = f.read()
-                try:
-                    sld_body = raw.decode("utf-8-sig")
-                except UnicodeDecodeError:
-                    sld_body = raw.decode("latin-1")
-
-                sld_body = re.sub(
-                    r"(<NamedLayer>\s*<Name>)[^<]*(</Name>)",
-                    lambda m: f"{m.group(1)}{layer}{m.group(2)}",
-                    sld_body,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-
-                style_name = f"style_{resource_id}"
-
-                if geoserver_api.upload_style(style_name, sld_body):
-                    geoserver_api.set_layer_style(geoserver_name, style_name)
-            except Exception as e:
-                log.error(
-                    f"Failed to cleanly apply SLD style {sld_res.get('id')} to {resource_id}: {e}"
-                )
 
         bbox = geoserver_api.get_bounding_box(geoserver_name)
         bbox_suffix = f"&bbox={bbox}" if bbox else ""
@@ -477,3 +565,126 @@ def geoserver_setup_workspace(context, data_dict):
         }
     except Exception as e:
         raise p.toolkit.ValidationError({"workspace_error": str(e)})
+
+
+# Datastore names are r_<uuid> (see _geoserver_name), or <uuid> / _<uuid> for
+# resources published by older versions (see _legacy_geoserver_names). Style
+# names are always style_<uuid> - the raw resource_id, with no 'r_' prefix
+# (see the style_name assignment above). Anything not matching these patterns
+# was not created by this extension and is left alone.
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_DATASTORE_NAME_RE = re.compile(rf"^(?:r_|_)?(?P<id>{_UUID})$", re.IGNORECASE)
+_STYLE_NAME_RE = re.compile(rf"^style_(?P<id>{_UUID})$", re.IGNORECASE)
+
+
+def _resource_is_gone(resource_id):
+    """True if the resource no longer exists or is deleted in CKAN, or its
+    dataset is deleted. package_delete leaves the resources of a deleted
+    dataset in the 'active' state, so the dataset state must be checked too.
+    Draft resources/datasets are not treated as gone.
+    """
+    import ckan.model as model
+
+    resource = model.Resource.get(resource_id)
+    if resource is None or resource.state == "deleted":
+        return True
+    package = resource.package
+    return package is None or package.state == "deleted"
+
+
+def _datastore_is_orphaned(name, resource_id, workspace):
+    """True if the resource is gone, or if the resource now points at a
+    different GeoServer layer (e.g. a legacy-named datastore left behind
+    after the resource was republished under the r_ name).
+    """
+    if _resource_is_gone(resource_id):
+        return True
+
+    import ckan.model as model
+
+    current_layer = model.Resource.get(resource_id).extras.get("geoserver_layer")
+    # No layer recorded: we cannot tell which datastore is live, so keep it.
+    return bool(current_layer) and current_layer != f"{workspace}:{name}"
+
+
+def _style_is_orphaned(resource_id):
+    """True if the resource is gone, or its dataset no longer has an active
+    SLD resource (the SLD was deleted, or its format changed).
+    """
+    if _resource_is_gone(resource_id):
+        return True
+
+    import ckan.model as model
+
+    package = model.Resource.get(resource_id).package
+    return not any(
+        r.state == "active" and (r.format or "").lower() == "sld"
+        for r in package.resources_all
+    )
+
+
+@p.toolkit.side_effect_free
+def geoserver_find_orphans(context, data_dict):
+    """List GeoServer datastores/styles whose CKAN resource no longer exists
+    or is deleted (or whose dataset is deleted), styles whose dataset no
+    longer has an SLD, plus legacy-named datastores that the resource no
+    longer points at. Read-only - does not delete
+    anything.
+    """
+    p.toolkit.check_access("sysadmin", context, data_dict)
+    geoserver_api = GeoServerAPI()
+    workspace = geoserver_api.workspace
+
+    orphaned_datastores = [
+        name
+        for name in geoserver_api.list_datastores()
+        if (match := _DATASTORE_NAME_RE.match(name))
+        and _datastore_is_orphaned(name, match.group("id"), workspace)
+    ]
+    orphaned_styles = [
+        name
+        for name in geoserver_api.list_styles()
+        if (match := _STYLE_NAME_RE.match(name))
+        and _style_is_orphaned(match.group("id"))
+    ]
+
+    return {
+        "orphaned_datastores": orphaned_datastores,
+        "orphaned_styles": orphaned_styles,
+    }
+
+
+def geoserver_delete_orphans(context, data_dict):
+    """Delete the GeoServer datastores/styles named in data_dict (as returned
+    by geoserver_find_orphans). Never guesses - only deletes exact names
+    handed to it.
+    """
+    p.toolkit.check_access("sysadmin", context, data_dict)
+    geoserver_api = GeoServerAPI()
+
+    deleted_datastores = []
+    failed_datastores = []
+    for name in data_dict.get("orphaned_datastores", []):
+        try:
+            geoserver_api.delete_layer(name)
+            deleted_datastores.append(name)
+        except Exception as e:
+            log.error(f"Failed to delete orphaned datastore {name}: {e}")
+            failed_datastores.append(name)
+
+    deleted_styles = []
+    failed_styles = []
+    for name in data_dict.get("orphaned_styles", []):
+        try:
+            geoserver_api.delete_style(name)
+            deleted_styles.append(name)
+        except Exception as e:
+            log.error(f"Failed to delete orphaned style {name}: {e}")
+            failed_styles.append(name)
+
+    return {
+        "deleted_datastores": deleted_datastores,
+        "failed_datastores": failed_datastores,
+        "deleted_styles": deleted_styles,
+        "failed_styles": failed_styles,
+    }

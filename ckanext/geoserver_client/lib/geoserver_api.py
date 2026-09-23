@@ -147,6 +147,40 @@ class GeoServerAPI(object):
 
         return None
 
+    def list_datastores(self):
+        """Names of every datastore currently in the workspace."""
+        try:
+            res = self._request(
+                "GET", f"workspaces/{self.workspace}/datastores.json"
+            )
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                return []
+            raise
+        data_stores = (res or {}).get("dataStores")
+        if not isinstance(data_stores, dict):
+            return []
+        entries = data_stores.get("dataStore") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        return [e["name"] for e in entries if "name" in e]
+
+    def list_styles(self):
+        """Names of every style currently in the workspace."""
+        try:
+            res = self._request("GET", f"workspaces/{self.workspace}/styles.json")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                return []
+            raise
+        styles = (res or {}).get("styles")
+        if not isinstance(styles, dict):
+            return []
+        entries = styles.get("style") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        return [e["name"] for e in entries if "name" in e]
+
     def delete_layer(self, resource_id):
         try:
             self._request(
@@ -157,4 +191,20 @@ class GeoServerAPI(object):
             # 404 means it's already deleted or never existed, which is fine
             if e.response.status_code != 404:
                 log.error(f"GeoServer datastore deletion failed: {e.response.text}")
+                raise
+
+    def delete_style(self, style_name):
+        # recurse=true removes the style from layers that use it (GeoServer
+        # refuses to delete a style in use otherwise). Those layers fall back
+        # to GeoServer's built-in default style for their geometry type.
+        try:
+            self._request(
+                "DELETE",
+                f"workspaces/{self.workspace}/styles/{style_name}"
+                "?purge=true&recurse=true",
+            )
+        except requests.exceptions.HTTPError as e:
+            # 404 means it's already deleted or never existed, which is fine
+            if e.response.status_code != 404:
+                log.error(f"GeoServer style deletion failed: {e.response.text}")
                 raise
